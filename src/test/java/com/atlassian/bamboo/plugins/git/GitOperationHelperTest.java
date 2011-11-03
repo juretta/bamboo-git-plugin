@@ -6,6 +6,9 @@ import com.atlassian.bamboo.commit.CommitFile;
 import com.atlassian.bamboo.commit.CommitFileImpl;
 import com.atlassian.bamboo.v2.build.BuildRepositoryChanges;
 import com.atlassian.testtools.ZipResourceDirectory;
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.IOUtils;
+import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.storage.file.FileRepository;
 import org.eclipse.jgit.transport.Transport;
 import org.testng.annotations.DataProvider;
@@ -17,6 +20,8 @@ import java.util.Arrays;
 import java.util.List;
 
 import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertTrue;
+import static org.testng.Assert.assertFalse;
 
 public class GitOperationHelperTest extends GitAbstractTest
 {
@@ -291,7 +296,31 @@ public class GitOperationHelperTest extends GitAbstractTest
             assertEquals(buildChanges.getChanges().get(i).getComment(), Integer.toString(150 - i) + "\n");
         }
     }
-    
+
+    @Test
+    public void testSymlinksCreationWorks() throws Exception
+    {
+        File sourceDir = createTempDirectory();
+        File cacheDir = createTempDirectory();
+        ZipResourceDirectory.copyZipResourceToDirectory("git-repo-with-symlinks.zip", sourceDir);
+        String expectedCommitId = "7dbe73f4b7dde41bbe0ca31f285321158c8baa57";
+        String commitId = createGitOperationHelper().checkout(cacheDir, sourceDir, expectedCommitId, null);
+        assertEquals(expectedCommitId, commitId);
+
+        // Symlink 1 should exist
+        final File symlink = new File(sourceDir, "link-to-test.txt");
+        assertTrue(FileUtils.isSymlink(symlink), "link-to-test.txt should be a symlink");
+        final String content = FileUtils.readFileToString(symlink);
+        assertEquals("This is the content of test.txt", content.trim());
+
+        // Symlink 2 should exist
+        assertTrue(FileUtils.isSymlink(new File(sourceDir, "src/test/resources/link-to-test-in-main-resources.txt")), "link-to-test-in-main-resources.txt should be a symlink");
+
+        // Unlike the C git client, for security reasons we *don't* support symlinks that point to files outside of the working directory
+        assertFalse(FileUtils.isSymlink(new File(sourceDir, "passwd-symlink")), "passwd-symlink should _not_ be a symlink");
+        assertFalse(FileUtils.isSymlink(new File(sourceDir, "passwd-symlink-rel")), "passwd-symlink-rel should _not_ be a symlink");
+    }
+
    @DataProvider
     Object[][] transportMappingData()
     {

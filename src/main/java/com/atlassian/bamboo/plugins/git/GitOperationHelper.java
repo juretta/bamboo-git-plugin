@@ -23,11 +23,14 @@ import org.eclipse.jgit.errors.MissingObjectException;
 import org.eclipse.jgit.errors.NotSupportedException;
 import org.eclipse.jgit.errors.TransportException;
 import org.eclipse.jgit.lib.Constants;
+import org.eclipse.jgit.lib.FileMode;
 import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.PersonIdent;
 import org.eclipse.jgit.lib.Ref;
 import org.eclipse.jgit.lib.RefUpdate;
+import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.revwalk.RevCommit;
+import org.eclipse.jgit.revwalk.RevTree;
 import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.storage.file.FileRepository;
 import org.eclipse.jgit.storage.file.FileRepositoryBuilder;
@@ -311,6 +314,8 @@ public class GitOperationHelper
     @NotNull
     public String checkout(@Nullable File cacheDirectory, @NotNull final File sourceDirectory, @NotNull final String targetRevision, @Nullable final String previousRevision) throws RepositoryException
     {
+
+        final boolean allowSymlinksOutsideWorkdir = false; // The C-git client allows symlinks to be created with absolute paths (e.g. to /etc/passwd), we don't want that on an agent
         // would be cool to store lastCheckoutedRevision in the localRepository somehow - so we don't need to specify it
         buildLogger.addBuildLogEntry(textProvider.getText("repository.git.messages.checkingOutRevision", Arrays.asList(targetRevision)));
         FileRepository localRepository = null;
@@ -349,6 +354,12 @@ public class GitOperationHelper
             refUpdate.setNewObjectId(targetCommit);
             refUpdate.forceUpdate();
             // if new branch -> refUpdate.link() instead of forceUpdate()
+
+
+            // Create proper symlinks
+            final RevTree tree = targetCommit.getTree();
+            final File parent = localRepository.getWorkTree();
+            traverse(parent, localRepository, tree.toObjectId(), allowSymlinksOutsideWorkdir);
 
             return targetCommit.getId().getName();
         }
@@ -528,6 +539,126 @@ public class GitOperationHelper
         catch (IOException e)
         {
             throw new RepositoryException(buildLogger.addErrorLogEntry(textProvider.getText("repository.git.messages.failedToOpenTransport", Arrays.asList(accessData.repositoryUrl))), e);
+        }
+    }
+
+    /**
+     * Creates a symlink {@code symlink} pointing to @{code linkTarget}. Note: The current implementation only works for POSIX operating systems.
+     *
+     * <p>
+     * If {@code allowSymlinksOutsideWorkdir} is false, the method checks if the target points to a file/directory inside {@code repoWorkDir}.
+     * </p>
+     *
+     * As of Java 7 this can be replaced by {@link Files.createSymbolicLink(newLink, target)}
+     *
+     * @param repoWorkDir - The directory containing the source checkout
+     * @param symlink - The file that should be a symlink
+     * @param linkTarget - The link target
+     * @param allowSymlinksOutsideWorkdir - whether to allow links to files/directories outside of {@code repoWorkDir}
+     *
+     * @throws IOException
+     * @throws InterruptedException if the symlink cannot be created
+     */
+    private void createSymlink(File repoWorkDir, File symlink, String linkTarget, boolean allowSymlinksOutsideWorkdir) throws IOException, InterruptedException
+    {
+        // Symlinks not implemented for Windows as it doesn't work. Well not entirely true, XP and 7 can apparently do it
+        if (System.getProperty("os.name").startsWith("Win"))
+        {
+            buildLogger.addErrorLogEntry("Symlinks are currently not supported on Windows");
+            return;
+        }
+
+        File checkTarget = new File(linkTarget);
+        if (!allowSymlinksOutsideWorkdir && !isChildOf(repoWorkDir, symlink, checkTarget))
+        {
+            buildLogger.addErrorLogEntry("Unable to create a symlink that points to a file/directory outside the working directory. Link target: " + checkTarget);
+            return;
+        }
+
+        if(FileUtils.isSymlink(symlink))
+        {
+            log.debug("Tried to create a symlink for " + symlink + " but the symlink already exists.");
+            return;
+        }
+
+        FileUtils.deleteQuietly(symlink);
+
+        // create symlink
+        final List<String> args = new ArrayList<String>();
+        args.add("ln");
+        args.add("-s");
+        args.add(linkTarget);
+        args.add(symlink.getAbsolutePath());
+
+        ProcessExecution.ExecutionResult<List<String>> executionResult = new ProcessExecution().executeCommand(args, new ProcessExecution.ListStreamConverter());
+        final List<String> errors = executionResult.getErrors();
+        if(!errors.isEmpty()) {
+            for(String error : errors) {
+                log.error(error);
+            }
+        }
+    }
+
+    /**
+     * Checks whether the file path of {@code targetLink} (based on the position of the {@code symlink} is a child of the {@code parent} directory.
+     * <p>
+     *     This does <b>not</b> check if the files/directories actually exists and is solely based on the file paths.
+     * </p>
+     *
+     * @param parent - The directory containing {@code child}
+     * @param symlinkFile - The file representing the symlink
+     * @param targetLink - The target of the symlink
+     * @return true if {@code child} is a child node of {@code parent}
+     * @throws IOException
+     */
+    private boolean isChildOf(File parent, File symlinkFile, File targetLink) throws IOException
+    {
+        if (!parent.isDirectory())
+        {
+            throw new IllegalArgumentException("Expected 'parent' to be a directory instead of a file");
+        }
+
+        if(targetLink.isAbsolute()) {
+            return targetLink.getCanonicalFile().getAbsolutePath().startsWith(parent.getCanonicalFile().getAbsolutePath());
+        }
+        return !targetLink.getPath().contains("..") || new File(symlinkFile.getParent(), targetLink.getPath()).getCanonicalFile().getAbsolutePath().startsWith(parent.getCanonicalFile().getAbsolutePath());
+    }
+
+    /**
+     * Traverse the git tree objects and replace all the symlinks with actual symlinks on the filesystem.
+     */
+    private void traverse(File parent, Repository repository, ObjectId parentTreeId, boolean allowSymlinksOutsideWorkdir) throws IOException
+    {
+        final TreeWalk tw = new TreeWalk(repository);
+        tw.setRecursive(true);
+        try
+        {
+            tw.addTree(parentTreeId);
+            while (tw.next())
+            {
+                final FileMode fm = tw.getFileMode(0);
+                final int objectType = fm.getObjectType();
+                final String path = tw.getPathString();
+                if (objectType == Constants.OBJ_BLOB && fm.equals(FileMode.TYPE_SYMLINK))
+                {
+                    final ObjectId blobId = tw.getObjectId(0);
+                    final String linkTarget = new String(repository.getObjectDatabase().open(blobId).getCachedBytes(), "UTF-8");
+                    final File fileThatShouldBeASymlink = new File(parent, path);
+                    try
+                    {
+                        createSymlink(repository.getWorkTree(), fileThatShouldBeASymlink, linkTarget, allowSymlinksOutsideWorkdir);
+                    }
+                    catch (InterruptedException e)
+                    {
+                        log.error("Failed to create a symlink");
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            }
+        }
+        finally
+        {
+            tw.release();
         }
     }
 }
